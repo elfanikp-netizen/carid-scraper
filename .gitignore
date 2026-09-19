@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Browser / runtime
+chrome_profile/
+debug/
+*.tmp.xlsx
+output.xlsx
+results.xlsx
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
