@@ -66,8 +66,9 @@ FITMENT_CONTAINER_SELECTORS = (
 
 OUTPUT_COLUMNS = [
     "Partslink Number", "Oldest Year", "Newest Year", "Brand", "Model", "Type",
-    "Interchange Number", "OEM Number", "Number Values", "Multiple values", "Part Brand",
-    "Product URL", "Status",
+    "Interchange Number", "Interchange 1", "Interchange 2", "Interchange 3", "Interchange 4", "Interchange 5",
+    "OEM Number", "OEM 1", "OEM 2", "OEM 3", "OEM 4", "OEM 5",
+    "Number Values", "Multiple values", "Part Brand", "Product URL", "Status",
 ]
 
 KNOWN_MAKES = [
@@ -175,8 +176,42 @@ def _sanitize_oem_value(value):
     if value is None:
         return ""
     value = str(value).strip()
+    value = re.sub(r"\s+", "", value)
     value = re.sub(r"[^A-Za-z0-9]", "", value)
     return value.upper()
+
+
+def _strip_spaces_from_oem_text(value):
+    if value is None:
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+
+    pieces = []
+    for chunk in re.split(r"[,;/|\n]+", raw):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        cleaned = re.sub(r"\s+", "", chunk)
+        if cleaned:
+            pieces.append(cleaned)
+
+    merged = []
+    run = []
+    for piece in pieces:
+        is_short_fragment = bool(re.fullmatch(r"(?i)[A-Za-z0-9]{1,6}", piece)) and bool(re.search(r"\d", piece))
+        if is_short_fragment:
+            run.append(piece)
+            continue
+        if run:
+            merged.append("".join(run))
+            run = []
+        merged.append(piece)
+    if run:
+        merged.append("".join(run))
+
+    return "; ".join(merged)
 
 
 def _is_valid_interchange(value):
@@ -251,6 +286,24 @@ def _choose_oem_fields(raw, part_number=""):
 
     oem = _sanitize_oem_value(oem_candidates[-1]) if oem_candidates else ""
     return interchange, oem
+
+
+def _collect_unique_values(raw_value, part_number="", max_values=5, keep_interchanges=False):
+    """Return up to max_values unique values from a raw text blob, preserving order."""
+    values = []
+    seen = set()
+    for candidate in _split_number_candidates(raw_value, part_number):
+        if _is_valid_interchange(candidate) and not keep_interchanges:
+            continue
+        if not _is_valid_interchange(candidate) and keep_interchanges:
+            continue
+        key = _sanitize_oem_value(candidate)
+        if candidate and key and key not in seen:
+            seen.add(key)
+            values.append(candidate)
+        if len(values) >= max_values:
+            break
+    return values
 
 
 def _regex_numbers(text, *labels):
@@ -352,6 +405,7 @@ def parse_product(html, url="", part_number=""):
         or _regex_numbers(text, "oe numbers", "oe number", "oem number", "oem numbers", "original equipment")
         or _schema_product_numbers(ld)
     )
+    oe_raw = _strip_spaces_from_oem_text(oe_raw)
     interchange_pair_values = [
         val for key, val in pairs.items()
         if any(n in key for n in ("interchange", "cross reference"))
@@ -361,6 +415,8 @@ def parse_product(html, url="", part_number=""):
         or _pair_lookup(pairs, "interchange", "cross reference")
         or _regex_numbers(text, "interchange number", "interchange numbers", "interchange")
     )
+    if part_number:
+        log_action("Part", f"Raw OE / interchange text for {part_number}: oe_raw={oe_raw!r}, interchange_raw={interchange_raw!r}")
     number_values = []
     seen_numbers = set()
     for raw_value in (oe_raw, interchange_raw):
@@ -369,6 +425,33 @@ def parse_product(html, url="", part_number=""):
             if candidate and key and key not in seen_numbers:
                 seen_numbers.add(key)
                 number_values.append(candidate)
+
+    oe_values = [
+        _sanitize_oem_value(v)
+        for v in _collect_unique_values(oe_raw, part_number, max_values=5, keep_interchanges=False)
+    ]
+    interchange_values = [
+        v.strip()
+        for v in _collect_unique_values(interchange_raw, part_number, max_values=5, keep_interchanges=True)
+    ]
+
+    fallback_seen_oem = set(oe_values)
+    fallback_seen_interchange = set(interchange_values)
+    for candidate in number_values:
+        value = str(candidate).strip()
+        if not value:
+            continue
+        if _is_valid_interchange(value):
+            clean = value.strip()
+            if clean and clean not in fallback_seen_interchange:
+                fallback_seen_interchange.add(clean)
+                interchange_values.append(clean)
+        else:
+            clean = _sanitize_oem_value(value)
+            if clean and clean not in fallback_seen_oem:
+                fallback_seen_oem.add(clean)
+                oe_values.append(clean)
+
     interchange, oem = _choose_oem_fields(oe_raw, part_number)
 
     if not oem and oe_raw:
@@ -394,6 +477,11 @@ def parse_product(html, url="", part_number=""):
             if cleaned and cleaned != _normalize_part_value(part_number):
                 oem = cleaned
 
+    if not oe_values and oem:
+        oe_values = [oem]
+    if not interchange_values and interchange:
+        interchange_values = [interchange]
+
     part_type = _pair_lookup(pairs, "part type", "product type", "type")
     if not part_type:
         part_type = _clean(ld.get("category", "")) if isinstance(ld.get("category", ""), str) else ""
@@ -414,13 +502,25 @@ def parse_product(html, url="", part_number=""):
         "Brand": brands,
         "Model": models,
         "Type": part_type,
-        "Interchange Number": interchange,
-        "OEM Number": oem,
+        "Interchange Number": interchange_values[0] if interchange_values else interchange,
+        "Interchange 1": interchange_values[0] if len(interchange_values) > 0 else "",
+        "Interchange 2": interchange_values[1] if len(interchange_values) > 1 else "",
+        "Interchange 3": interchange_values[2] if len(interchange_values) > 2 else "",
+        "Interchange 4": interchange_values[3] if len(interchange_values) > 3 else "",
+        "Interchange 5": interchange_values[4] if len(interchange_values) > 4 else "",
+        "OEM Number": oe_values[0] if oe_values else _sanitize_oem_value(oem),
+        "OEM 1": oe_values[0] if len(oe_values) > 0 else "",
+        "OEM 2": oe_values[1] if len(oe_values) > 1 else "",
+        "OEM 3": oe_values[2] if len(oe_values) > 2 else "",
+        "OEM 4": oe_values[3] if len(oe_values) > 3 else "",
+        "OEM 5": oe_values[4] if len(oe_values) > 4 else "",
         "Number Values": "; ".join(number_values),
-        "Multiple values": len(number_values) > 1,
+        "Multiple values": len(interchange_values) > 1 or len(oe_values) > 1,
         "Part Brand": part_brand,
         "Product URL": url,
     }
+    if part_number:
+        log_action("Part", f"Parsed number values for {part_number}: number_values={number_values}, interchange={interchange_values or ([interchange] if interchange else [])}, oem={oe_values or ([oem] if oem else [])}")
     key_fields = ["Oldest Year", "Brand", "Model", "Interchange Number", "OEM Number"]
     if not any(row[k] for k in key_fields):
         row["Status"] = "parse_empty"
