@@ -66,7 +66,8 @@ FITMENT_CONTAINER_SELECTORS = (
 
 OUTPUT_COLUMNS = [
     "Partslink Number", "Oldest Year", "Newest Year", "Brand", "Model", "Type",
-    "Interchange Number", "OEM Number", "Part Brand", "Product URL", "Status",
+    "Interchange Number", "OEM Number", "Number Values", "Multiple values", "Part Brand",
+    "Product URL", "Status",
 ]
 
 KNOWN_MAKES = [
@@ -185,6 +186,35 @@ def _is_valid_interchange(value):
     if len(s) < 8:
         return False
     return bool(re.fullmatch(r"(?i)[A-Za-z0-9]{2,4}-[A-Za-z0-9]{5,7}", s))
+
+
+def _split_number_candidates(raw, part_number=""):
+    """Return all interchange and OEM candidates, preserving each value's original formatting style."""
+    if not raw:
+        return []
+    parts = [t.strip() for t in re.split(r"[,;/|\n]+", str(raw)) if t and t.strip()]
+    if part_number:
+        pn = _normalize_part_value(part_number)
+        parts = [t for t in parts if _normalize_part_value(t) != pn]
+
+    out = []
+    seen = set()
+    for p in parts:
+        v = str(p).strip()
+        if not re.search(r"\d", v):
+            continue
+        if _is_valid_interchange(v):
+            key = _sanitize_oem_value(v)
+            display = v
+        else:
+            key = _sanitize_oem_value(v)
+            display = key
+        if not key:
+            continue
+        if key not in seen:
+            seen.add(key)
+            out.append(display)
+    return out
 
 
 def _choose_oem_fields(raw, part_number=""):
@@ -312,11 +342,33 @@ def parse_product(html, url="", part_number=""):
     pairs = _extract_pairs(soup)
     ld = _jsonld_product(soup)
 
+    oe_pair_values = [
+        val for key, val in pairs.items()
+        if any(n in key for n in ("oe numbers", "oe number", "oem", "oem number", "oem numbers", "original equipment"))
+    ]
     oe_raw = (
-        _pair_lookup(pairs, "oe numbers", "oe number", "oem", "oem number", "oem numbers", "original equipment")
+        " ; ".join(v for v in oe_pair_values if v)
+        or _pair_lookup(pairs, "oe numbers", "oe number", "oem", "oem number", "oem numbers", "original equipment")
         or _regex_numbers(text, "oe numbers", "oe number", "oem number", "oem numbers", "original equipment")
         or _schema_product_numbers(ld)
     )
+    interchange_pair_values = [
+        val for key, val in pairs.items()
+        if any(n in key for n in ("interchange", "cross reference"))
+    ]
+    interchange_raw = (
+        " ; ".join(v for v in interchange_pair_values if v)
+        or _pair_lookup(pairs, "interchange", "cross reference")
+        or _regex_numbers(text, "interchange number", "interchange numbers", "interchange")
+    )
+    number_values = []
+    seen_numbers = set()
+    for raw_value in (oe_raw, interchange_raw):
+        for candidate in _split_number_candidates(raw_value, part_number):
+            key = _sanitize_oem_value(candidate)
+            if candidate and key and key not in seen_numbers:
+                seen_numbers.add(key)
+                number_values.append(candidate)
     interchange, oem = _choose_oem_fields(oe_raw, part_number)
 
     if not oem and oe_raw:
@@ -364,6 +416,8 @@ def parse_product(html, url="", part_number=""):
         "Type": part_type,
         "Interchange Number": interchange,
         "OEM Number": oem,
+        "Number Values": "; ".join(number_values),
+        "Multiple values": len(number_values) > 1,
         "Part Brand": part_brand,
         "Product URL": url,
     }
@@ -432,7 +486,7 @@ def _kill_chrome_processes():
 
 def reset_chrome(chrome_path=None):
     """Hard reset a stale DevTools Chrome session before continuing."""
-    print("[chrome] Resetting stale browser session...")
+    log_action("Chrome", "Resetting stale browser session")
     _kill_chrome_processes()
     time.sleep(2)
     if chrome_path is None:
@@ -442,10 +496,11 @@ def reset_chrome(chrome_path=None):
 
 def start_chrome(chrome_path):
     if cdp_alive(CDP_PORT):
-        print(f"[chrome] Re-using Chrome already listening on port {CDP_PORT}")
+        log_action("Chrome", f"Re-using existing session on port {CDP_PORT}")
         return None
     if not chrome_path:
         sys.exit("Could not find Google Chrome. Install it or pass --chrome-path \"C:\\...\\chrome.exe\"")
+    log_action("Chrome", f"Launching browser at {chrome_path}")
     try:
         PROFILE_DIR.mkdir(exist_ok=True)
     except PermissionError as e:
@@ -462,6 +517,7 @@ def start_chrome(chrome_path):
     ])
     for _ in range(40):
         if cdp_alive(CDP_PORT):
+            log_action("Chrome", "DevTools connection ready")
             return proc
         time.sleep(0.5)
     proc.terminate()
@@ -485,24 +541,23 @@ def is_challenge(page):
 def wait_for_challenge(page, timeout=900):
     if not is_challenge(page):
         return
-    print("\a\n[cloudflare] Verification page detected.")
-    print("             Please click the checkbox / finish the check in the Chrome window.")
-    print("             The script will continue automatically...")
+    log_action("Cloudflare", "Verification page detected; finish the check in the Chrome window")
     start = time.time()
     while time.time() - start < timeout:
         time.sleep(2)
         if not is_challenge(page):
-            print("[cloudflare] Cleared, continuing.\n")
+            log_action("Cloudflare", "Cleared; continuing")
             time.sleep(1.5)
             return
     sys.exit("Timed out waiting for the Cloudflare check to be completed.")
 
 
 def goto(page, url):
+    log_action("Navigate", url)
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
     except Exception as e:
-        print(f"[warn] navigation issue ({type(e).__name__}); checking for challenge...")
+        log_action("Warning", f"Navigation issue ({type(e).__name__}); checking for challenge")
     wait_for_challenge(page)
 
 
@@ -510,8 +565,17 @@ def human_pause(lo, hi):
     time.sleep(random.uniform(lo, hi))
 
 
+def log_action(action, details=""):
+    stamp = time.strftime("%H:%M:%S")
+    message = f"[{stamp}] {action}"
+    if details:
+        message += f" - {details}"
+    print(message, flush=True)
+
+
 def open_search_panel(page):
     """CARiD starts with a collapsed header search widget; click it so the real #search-field appears."""
+    log_action("Search", "Opening the site search panel")
     selectors = [
         '.header-search-label',
         '.js-search-input-for-preact-render .header-search-label',
@@ -527,6 +591,7 @@ def open_search_panel(page):
                     if candidate.is_visible():
                         candidate.click(force=True)
                         page.wait_for_timeout(500)
+                        log_action("Search", "Search panel opened")
                         return True
                 except Exception:
                     continue
@@ -556,6 +621,7 @@ def apply_search_value(box, value):
 def set_search_value(page, box, value):
     if not value:
         return False
+    log_action("Search", f"Entering part number: {value}")
     try:
         box.wait_for(state="visible", timeout=20000)
         box.scroll_into_view_if_needed()
@@ -609,6 +675,7 @@ def set_search_value(page, box, value):
 
 
 def run_search(page, pn, args):
+    log_action("Search", f"Starting lookup for {pn}")
     if args.search_url:
         goto(page, args.search_url.format(q=quote_plus(pn)))
     else:
@@ -618,13 +685,16 @@ def run_search(page, pn, args):
         box = find_search_box(page)
         if box is None:
             raise RuntimeError("search field not found after page load")
+        log_action("Search", f"Found search box for {pn}")
 
         if not set_search_value(page, box, pn):
             raise RuntimeError("search field found but could not receive the part number")
 
         if not wait_for_search_results(page):
+            log_action("Search", "No live result list yet; waiting a bit longer")
             page.wait_for_timeout(1500)
         if click_first_search_result(page, pn):
+            log_action("Search", "Clicked first matching product result")
             return
 
         try:
@@ -761,7 +831,9 @@ def wait_for_search_results(page, timeout_ms=20000):
 
 def click_first_search_result(page, pn):
     """Click the first visible product result in the live search results panel."""
+    log_action("Search", "Checking result list for a product match")
     if not wait_for_search_results(page):
+        log_action("Search", "No visible results found in the live list")
         return False
 
     item_links = page.locator('.departments-grid .item-departments a[href]')
@@ -952,6 +1024,7 @@ def _page_matches_part_number(html, pn):
 
 def process_part(page, pn, args):
     """Return a list of result rows (dicts) for one part number."""
+    log_action("Part", f"Processing {pn}")
     for attempt in range(2):
         run_search(page, pn, args)
         if args.debug:
@@ -959,23 +1032,28 @@ def process_part(page, pn, args):
 
         html = page.content()
         if is_product_html(html):
+            log_action("Part", f"Detected product page for {pn}")
             if _page_matches_part_number(html, pn):
                 urls = [page.url]
                 break
             # stale/incorrect product page: reset and retry once with a fresh page
             if attempt == 0:
+                log_action("Part", "Product page mismatched; retrying with a fresh search")
                 goto(page, BASE)
                 continue
             return [{"Partslink Number": pn, "Status": "not_found"}]
 
         urls = collect_product_links(page, args.max_products, pn)
         if urls and any(_page_matches_part_number(page.content(), pn) for _ in [0]):
+            log_action("Part", f"Found {len(urls)} matching product URL(s) for {pn}")
             break
         if not urls:
+            log_action("Part", f"No product results found for {pn}")
             if not args.debug:
                 dump_debug(page, pn, "search_noresult")
             return [{"Partslink Number": pn, "Status": "not_found"}]
         if attempt == 0:
+            log_action("Part", "Search results were stale; refreshing the page")
             goto(page, BASE)
             continue
         break
@@ -983,12 +1061,15 @@ def process_part(page, pn, args):
     rows = []
     for i, url in enumerate(urls):
         if url != page.url:
+            log_action("Part", f"Opening product page {i + 1}: {url}")
             human_pause(1.5, 3.0)
             goto(page, url)
             time.sleep(1.5)
         html = page.content()
         if not _page_matches_part_number(html, pn):
+            log_action("Part", f"Skipped product page for {pn}; part number not found on page")
             continue
+        log_action("Part", f"Parsing product page {i + 1} for {pn}")
         row = parse_product(html, page.url, part_number=pn)
         row["Partslink Number"] = pn
         if args.debug or row["Status"] == "parse_empty":
@@ -1151,6 +1232,7 @@ def main():
             print("[ready] Browser is on carid.com. Starting...\n")
 
             for n, pn in enumerate(parts, 1):
+                log_action("Loop", f"Starting part {n}/{len(parts)}: {pn}")
                 if page is not None:
                     try:
                         page.close()
@@ -1175,12 +1257,14 @@ def main():
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
-                    print(f"ERROR {type(e).__name__}: {e}")
+                    log_action("Error", f"{type(e).__name__}: {e}")
                     result = [{"Partslink Number": pn, "Status": f"error: {type(e).__name__}"}]
                     if args.debug:
                         dump_debug(page, pn, "error")
                 else:
-                    print(", ".join(sorted({r.get('Status', '') for r in result})))
+                    statuses = ", ".join(sorted({r.get('Status', '') for r in result}))
+                    log_action("Result", statuses)
+                    print(statuses)
                 rows.extend(result)
                 save_results(rows, out_path)
                 if n < len(parts):
