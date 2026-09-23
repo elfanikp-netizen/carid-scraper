@@ -496,6 +496,8 @@ def parse_product(html, url="", part_number=""):
 
     oldest, newest, brands, models, fallback = _fitment(soup)
 
+    multiple_oem = len(oe_values) > 1
+    multiple_interchange = len(interchange_values) > 1
     row = {
         "Oldest Year": oldest,
         "Newest Year": newest,
@@ -515,7 +517,7 @@ def parse_product(html, url="", part_number=""):
         "OEM 4": oe_values[3] if len(oe_values) > 3 else "",
         "OEM 5": oe_values[4] if len(oe_values) > 4 else "",
         "Number Values": "; ".join(number_values),
-        "Multiple values": len(interchange_values) > 1 or len(oe_values) > 1,
+        "Multiple values": multiple_oem or multiple_interchange,
         "Part Brand": part_brand,
         "Product URL": url,
     }

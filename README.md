@@ -1,3 +1,173 @@
+# CARiD Interchange Scraper
+
+Looks up interchange or cross-reference numbers on [carid.com](https://www.carid.com),
+parses the matched product page, and writes the product and fitment data to an Excel
+workbook.
+
+This script is intended for interchange values such as `ABC-123456`. It is separate
+from `carid_scraper.py`, which starts with Partslink numbers.
+
+## Requirements
+
+- Python 3.9 or newer
+- Google Chrome
+- An Excel input file (`.xlsx` or another format supported by pandas)
+
+## Installation
+
+```text
+python -m venv venv
+venv\Scripts\activate
+python -m pip install -r requirements.txt
+```
+
+On macOS or Linux, activate the environment with:
+
+```text
+source venv/bin/activate
+```
+
+No separate Playwright browser installation is required. The scraper controls the
+installed, visible Chrome browser through its DevTools connection.
+
+## Input file
+
+Create an Excel file with one value per row. The interchange column is selected in
+this order:
+
+1. The column named with `--column`.
+2. The first column whose header contains `interchange`, `cross-ref`, `cross reference`,
+   or `crossref`.
+3. A column whose header contains `OEM`, `OE`, `part link`, or `Partslink`.
+4. The first column in the workbook.
+
+Blank and duplicate values are ignored. Values are read as text so formatting and
+leading zeroes are preserved.
+
+Example:
+
+| Interchange |
+| --- |
+| ABC-123456 |
+| XYZ-987654 |
+
+## Quick test
+
+Run a small test before processing a large workbook:
+
+```text
+python carid_interchange_scraper.py --input input.xlsx --output results.xlsx --limit 3 --debug --no-resume
+```
+
+The script opens Chrome, navigates to CARiD, searches each value, and reads the first
+matching product by default. Use `--max-products N` to read more than one product per
+search.
+
+If CARiD displays a Cloudflare human-verification page, complete it manually in the
+Chrome window. The scraper does not bypass or automatically solve that check. The
+Chrome profile is stored in `./chrome_profile`, allowing the browser clearance to be
+reused on later runs.
+
+## Full run
+
+```text
+python carid_interchange_scraper.py --input input.xlsx --output results.xlsx
+```
+
+Progress is written to the output workbook after each input value. Press `Ctrl+C` to
+stop; progress already written to the workbook is retained. Use `--no-resume` to
+ignore an existing output workbook and start over.
+
+Keep the Chrome window open while the scraper is running. The default delay between
+searches is 4 to 9 seconds; increase it for larger runs:
+
+```text
+python carid_interchange_scraper.py --input input.xlsx --output results.xlsx --delay-min 6 --delay-max 12
+```
+
+Check CARiD's Terms of Use before running the scraper at volume.
+
+## Output columns
+
+The output workbook contains these columns:
+
+```text
+Partslink Number, Oldest Year, Newest Year, Brand, Model, Type,
+Interchange Number, Interchange 1 ... Interchange 5,
+OEM Number, OEM 1 ... OEM 5,
+Number Values, Multiple values, Part Brand, Product URL, Status
+```
+
+For interchange searches, `Partslink Number` is extracted from the matched product
+page when available. The original search value is recorded in `Interchange Number`
+when the product page does not provide one.
+
+## Command-line options
+
+| Option | Description |
+| --- | --- |
+| `--input FILE` | Excel file containing interchange values. Required for a browser run. |
+| `--output FILE` | Output workbook. Defaults to `results.xlsx`. |
+| `--column NAME` | Force the input column name. |
+| `--limit N` | Process only the first `N` unique values. |
+| `--max-products N` | Read up to `N` products per search. Defaults to `1`. |
+| `--delay-min SECONDS` | Minimum delay between searches. Defaults to `4`. |
+| `--delay-max SECONDS` | Maximum delay between searches. Defaults to `9`. |
+| `--search-url URL` | Optional search URL template containing `{q}`. |
+| `--chrome-path PATH` | Chrome executable path if automatic detection fails. |
+| `--no-resume` | Ignore an existing output workbook. |
+| `--debug` | Save page HTML and screenshots under `./debug`. |
+| `--parse-file FILE` | Parse a saved product HTML file without opening Chrome. |
+
+Example with an explicitly named column:
+
+```text
+python carid_interchange_scraper.py --input interchange.xlsx --column "Cross Reference" --output carid-results.xlsx
+```
+
+## Status values
+
+- `ok`: product data was parsed.
+- `ok-fitment-fallback`: fitment was found outside the usual fitment container; verify it.
+- `parse_empty`: a product page opened, but expected fields were not found.
+- `not_found`: no product result was found for the search value.
+- `error: ...`: an exception occurred. The value can be retried on a later run.
+
+## Debugging and offline parsing
+
+Run with `--debug` to save the HTML and screenshot for search and product pages. These
+files help identify layout changes or parsing problems without repeatedly searching
+CARiD.
+
+To test the parser against a saved product page:
+
+```text
+python carid_interchange_scraper.py --parse-file debug/ABC-123456_product1.html
+```
+
+If fields are empty, inspect the saved HTML and check the page's current labels and
+structure. The parser is implemented in `carid_scraper.py` and may need updates when
+CARiD changes its page layout.
+
+## Troubleshooting
+
+### Chrome cannot be found
+
+Pass the executable path explicitly, for example on Windows:
+
+```text
+python carid_interchange_scraper.py --input input.xlsx --chrome-path "C:\Program Files\Google\Chrome\Application\chrome.exe"
+```
+
+### DevTools connection fails
+
+Close all Chrome windows and retry. The scraper starts Chrome with a separate profile
+under `./chrome_profile` and connects on port `9222`.
+
+### Cloudflare keeps appearing
+
+Complete the verification manually in the visible Chrome window. Slower delays can
+also help reduce repeated checks.
 # carid_scraper
 
 Reads part numbers (Partslink) from an Excel file, searches each one on carid.com,
