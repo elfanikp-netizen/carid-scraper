@@ -113,17 +113,20 @@ def extract_partslink_number_from_html(html):
 def strip_partslink_from_oem_fields(row, partslink_value):
     if not partslink_value:
         return row
-    partslink_upper = str(partslink_value).upper()
     for key in ["OEM Number", "OEM 1", "OEM 2", "OEM 3", "OEM 4", "OEM 5"]:
         if key not in row:
             continue
         values = []
-        for v in str(row.get(key, "")).split("; "):
-            if not v:
+        for v in re.split(r"\s*;\s*|\s*\|\s*|\s*,\s*", str(row.get(key, ""))):
+            if not v or not str(v).strip():
                 continue
-            if v.upper() == partslink_upper:
+            normalized = re.sub(r"[^A-Za-z0-9]", "", str(v)).upper()
+            partlike = len(normalized) == 9 and normalized[:2].isalpha() and any(ch.isdigit() for ch in normalized)
+            if partlike:
                 continue
-            values.append(v)
+            if normalized == re.sub(r"[^A-Za-z0-9]", "", str(partslink_value)).upper():
+                continue
+            values.append(str(v).strip())
         row[key] = "; ".join(values)
     return row
 
@@ -176,6 +179,7 @@ def process_interchange_part(page, value, args):
         row = parse_product(html, page.url, part_number=partslink_value)
         if partslink_value:
             row["Partslink Number"] = partslink_value
+            row = strip_partslink_from_oem_fields(row, partslink_value)
         else:
             row["Partslink Number"] = row.get("Partslink Number", "")
         row["Interchange Number"] = value

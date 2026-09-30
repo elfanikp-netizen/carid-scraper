@@ -181,6 +181,30 @@ def _sanitize_oem_value(value):
     return value.upper()
 
 
+def _matches_partslink_format(value):
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", str(value or "")).upper()
+    if len(cleaned) != 9:
+        return False
+    if not cleaned[:2].isalpha():
+        return False
+    return any(ch.isdigit() for ch in cleaned)
+
+
+def _drop_part_number_matches(values, part_number):
+    out = []
+    pn = _normalize_part_value(part_number)
+    for v in values:
+        if not v:
+            continue
+        normalized = _normalize_part_value(v)
+        if normalized == pn:
+            continue
+        if _matches_partslink_format(v):
+            continue
+        out.append(v)
+    return out
+
+
 def _strip_spaces_from_oem_text(value):
     if value is None:
         return ""
@@ -430,6 +454,7 @@ def parse_product(html, url="", part_number=""):
         _sanitize_oem_value(v)
         for v in _collect_unique_values(oe_raw, part_number, max_values=5, keep_interchanges=False)
     ]
+    oe_values = _drop_part_number_matches(oe_values, part_number)
     interchange_values = [
         v.strip()
         for v in _collect_unique_values(interchange_raw, part_number, max_values=5, keep_interchanges=True)
@@ -477,8 +502,15 @@ def parse_product(html, url="", part_number=""):
             if cleaned and cleaned != _normalize_part_value(part_number):
                 oem = cleaned
 
+    if oem:
+        oem = _sanitize_oem_value(oem)
+        if _normalize_part_value(oem) == _normalize_part_value(part_number):
+            oem = ""
+
     if not oe_values and oem:
         oe_values = [oem]
+    else:
+        oe_values = _drop_part_number_matches(oe_values, part_number)
     if not interchange_values and interchange:
         interchange_values = [interchange]
 
