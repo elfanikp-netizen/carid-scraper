@@ -171,24 +171,14 @@ def process_interchange_part(page, value, args):
             continue
         log_action("Part", f"Parsing product page {i + 1} for {value}")
         print(f"[live] parsing product page {i + 1}: {page.url}")
-        row = parse_product(html, page.url)
         partslink_value = extract_partslink_number_from_html(html)
         print(f"[live] extracted partslink: {partslink_value or '<none>'}")
+        row = parse_product(html, page.url, part_number=partslink_value)
         if partslink_value:
             row["Partslink Number"] = partslink_value
         else:
             row["Partslink Number"] = row.get("Partslink Number", "")
-        if partslink_value:
-            cleaned_values = []
-            for v in str(row.get("Number Values", "")).split("; "):
-                if not v:
-                    continue
-                if v.upper() == partslink_value:
-                    continue
-                cleaned_values.append(v)
-            row["Number Values"] = "; ".join(cleaned_values)
-            row = strip_partslink_from_oem_fields(row, partslink_value)
-        row["Interchange Number"] = row.get("Interchange Number") or value
+        row["Interchange Number"] = value
         print(f"[live] parsed row: {row}")
         if args.debug or row["Status"] == "parse_empty":
             dump_debug(page, value, f"product{i + 1}")

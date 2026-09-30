@@ -99,8 +99,7 @@ Number Values, Multiple values, Part Brand, Product URL, Status
 ```
 
 For interchange searches, `Partslink Number` is extracted from the matched product
-page when available. The original search value is recorded in `Interchange Number`
-when the product page does not provide one.
+page when available. `Interchange Number` always contains the original search value.
 
 ## Command-line options
 
