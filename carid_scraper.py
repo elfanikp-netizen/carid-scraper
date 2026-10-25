@@ -813,7 +813,9 @@ def run_search(page, pn, args):
     if args.search_url:
         goto(page, args.search_url.format(q=quote_plus(pn)))
     else:
-        goto(page, BASE)
+        current_url = (page.url or "").lower()
+        if "about:blank" in current_url or "carid.com" not in current_url:
+            goto(page, BASE)
         open_search_panel(page)
 
         box = find_search_box(page)

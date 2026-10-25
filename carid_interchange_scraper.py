@@ -194,12 +194,19 @@ def process_interchange_part(page, value, args):
 
 def is_cdp_stale_error(message):
     msg = str(message).lower()
-    return any(token in msg for token in (
+    closed_tokens = (
+        "target page, context or browser has been closed",
+        "page, context or browser has been closed",
+        "browser context has been closed",
+        "browser has been closed",
+        "page has been closed",
+        "target closed",
+    )
+    return any(token in msg for token in closed_tokens) or any(token in msg for token in (
         "econnreset",
         "connection reset",
         "target.createtarget",
         "failed to open a new tab",
-        "target closed",
         "websocket",
         "unexpected eof",
         "connect_over_cdp",
@@ -292,34 +299,34 @@ def main():
 
             for n, value in enumerate(values, 1):
                 log_action("Loop", f"Starting interchange {n}/{len(values)}: {value}")
-                if page is not None:
+                if page is None:
                     try:
-                        page.close()
-                    except Exception:
-                        pass
-                try:
-                    page = context.new_page()
-                except Exception as e:
-                    msg = str(e)
-                    if is_cdp_stale_error(msg):
-                        print("[browser] Browser context became stale; restarting Chrome before continuing...")
-                        try:
-                            if browser is not None:
-                                browser.close()
-                        except Exception:
-                            pass
-                        try:
-                            if chrome_proc is not None:
-                                chrome_proc.terminate()
-                        except Exception:
-                            pass
-                        chrome_proc = start_chrome(find_chrome(args.chrome_path))
-                        browser = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
-                        context = browser.contexts[0] if browser.contexts else browser.new_context()
                         page = context.new_page()
-                    else:
-                        raise
-                page.set_default_timeout(30000)
+                    except Exception as e:
+                        msg = str(e)
+                        if is_cdp_stale_error(msg):
+                            print("[browser] Browser context became stale; restarting Chrome before continuing...")
+                            try:
+                                if browser is not None:
+                                    browser.close()
+                            except Exception:
+                                pass
+                            try:
+                                if chrome_proc is not None:
+                                    chrome_proc.terminate()
+                            except Exception:
+                                pass
+                            chrome_proc = start_chrome(find_chrome(args.chrome_path))
+                            browser = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                            context = browser.contexts[0] if browser.contexts else browser.new_context()
+                            page = context.new_page()
+                        else:
+                            raise
+                try:
+                    page.set_default_timeout(30000)
+                except Exception:
+                    page = context.new_page()
+                    page.set_default_timeout(30000)
                 print(f"[{n}/{len(values)}] {value} ... ", end="", flush=True)
                 try:
                     result = process_interchange_part(page, value, args)
