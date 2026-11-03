@@ -25,6 +25,8 @@ import platform
 import random
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import time
@@ -41,6 +43,7 @@ from playwright.sync_api import sync_playwright
 # --------------------------------------------------------------------------- #
 BASE = "https://www.carid.com"
 CDP_PORT = 9222
+_LOCAL_CDP_PORT = None
 PROFILE_DIR = Path("chrome_profile").resolve()
 DEBUG_DIR = Path("debug")
 
@@ -597,65 +600,86 @@ def cdp_alive(port):
         return False
 
 
-def _kill_chrome_processes():
-    """Best-effort cleanup of stale Chrome/Chromium processes left behind by earlier runs."""
-    commands = []
+def get_cdp_port():
+    configured_port = os.environ.get("CARID_CDP_PORT")
+    if configured_port:
+        return int(configured_port)
+    global _LOCAL_CDP_PORT
+    if _LOCAL_CDP_PORT is None:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            _LOCAL_CDP_PORT = probe.getsockname()[1]
+    return _LOCAL_CDP_PORT
+
+
+def stop_chrome(proc):
+    """Stop only the Chrome process tree this crawler launched."""
+    if proc is None or proc.poll() is not None:
+        return
     if platform.system() == "Windows":
-        commands = [
-            ["taskkill", "/F", "/IM", "chrome.exe"],
-            ["taskkill", "/F", "/IM", "chromium.exe"],
-            ["taskkill", "/F", "/IM", "msedge.exe"],
-        ]
-    else:
-        commands = [
-            ["pkill", "-f", "chrome.*--remote-debugging-port=9222"],
-            ["pkill", "-f", "chromium.*--remote-debugging-port=9222"],
-        ]
-    for cmd in commands:
         try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        except Exception:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=15,
+            )
+            proc.wait(timeout=5)
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        if platform.system() != "Windows":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
             pass
 
 
-def reset_chrome(chrome_path=None):
-    """Hard reset a stale DevTools Chrome session before continuing."""
+def reset_chrome(chrome_path=None, chrome_proc=None):
+    """Restart only this crawler's stale DevTools Chrome session."""
     log_action("Chrome", "Resetting stale browser session")
-    _kill_chrome_processes()
-    time.sleep(2)
+    stop_chrome(chrome_proc)
     if chrome_path is None:
         chrome_path = find_chrome()
     return start_chrome(chrome_path)
 
 
 def start_chrome(chrome_path):
-    if cdp_alive(CDP_PORT):
-        log_action("Chrome", f"Re-using existing session on port {CDP_PORT}")
-        return None
+    port = get_cdp_port()
+    if cdp_alive(port):
+        raise RuntimeError(f"Chrome DevTools port {port} is already in use; refusing to attach to another browser")
     if not chrome_path:
         sys.exit("Could not find Google Chrome. Install it or pass --chrome-path \"C:\\...\\chrome.exe\"")
     log_action("Chrome", f"Launching browser at {chrome_path}")
     try:
-        PROFILE_DIR.mkdir(exist_ok=True)
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     except PermissionError as e:
         sys.exit(f"Permission denied creating Chrome profile folder: {PROFILE_DIR}. Close any Chrome windows using it and rerun.")
     except OSError as e:
         sys.exit(f"Could not create Chrome profile folder: {PROFILE_DIR} ({e})")
     proc = subprocess.Popen([
         chrome_path,
-        f"--remote-debugging-port={CDP_PORT}",
+        f"--remote-debugging-port={port}",
         f"--user-data-dir={PROFILE_DIR}",
         "--no-first-run",
         "--no-default-browser-check",
         BASE,
-    ])
+    ], start_new_session=platform.system() != "Windows")
     for _ in range(40):
-        if cdp_alive(CDP_PORT):
+        if cdp_alive(port):
             log_action("Chrome", "DevTools connection ready")
             return proc
         time.sleep(0.5)
-    proc.terminate()
-    sys.exit("Chrome started but the DevTools port never opened. Close all Chrome windows and retry.")
+    stop_chrome(proc)
+    raise RuntimeError(f"Chrome started but its isolated DevTools port {port} never opened")
 
 
 def is_challenge(page):
@@ -709,6 +733,19 @@ def log_action(action, details=""):
 
 def open_search_panel(page):
     """CARiD starts with a collapsed header search widget; click it so the real #search-field appears."""
+    header_search_selectors = (
+        "#search-field",
+        'input[name="search-field"]',
+        ".search-form #search-field",
+        "input#native-search-input",
+    )
+    for selector in header_search_selectors:
+        try:
+            candidates = page.locator(selector)
+            if any(candidates.nth(index).is_visible() for index in range(candidates.count())):
+                return True
+        except Exception:
+            continue
     log_action("Search", "Opening the site search panel")
     selectors = [
         '.header-search-label',
@@ -813,9 +850,6 @@ def run_search(page, pn, args):
     if args.search_url:
         goto(page, args.search_url.format(q=quote_plus(pn)))
     else:
-        current_url = (page.url or "").lower()
-        if "about:blank" in current_url or "carid.com" not in current_url:
-            goto(page, BASE)
         open_search_panel(page)
 
         box = find_search_box(page)
@@ -1350,7 +1384,7 @@ def main():
             context = None
             while True:
                 try:
-                    browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
+                    browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{get_cdp_port()}")
                     context = browser.contexts[0] if browser.contexts else browser.new_context()
                     page = context.pages[0] if context.pages else context.new_page()
                     page.set_default_timeout(30000)
@@ -1359,7 +1393,7 @@ def main():
                     msg = str(e)
                     if "Target.createTarget" in msg or "Failed to open a new tab" in msg or "Target closed" in msg:
                         print("[browser] Stale Chrome/CDP session detected; restarting Chrome...")
-                        chrome_proc = reset_chrome(find_chrome(args.chrome_path))
+                        chrome_proc = reset_chrome(find_chrome(args.chrome_path), chrome_proc)
                         time.sleep(2)
                         continue
                     raise
@@ -1367,40 +1401,41 @@ def main():
             goto(page, BASE)
             print("[ready] Browser is on carid.com. Starting...\n")
 
+            def reconnect_browser():
+                nonlocal browser, context, page, chrome_proc
+                chrome_proc = reset_chrome(find_chrome(args.chrome_path), chrome_proc)
+                browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{get_cdp_port()}")
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = context.pages[0] if context.pages else context.new_page()
+                page.set_default_timeout(30000)
+
             for n, pn in enumerate(parts, 1):
                 log_action("Loop", f"Starting part {n}/{len(parts)}: {pn}")
-                if page is not None:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
-                try:
-                    page = context.new_page()
-                except Exception as e:
-                    msg = str(e)
-                    if "Target.createTarget" in msg or "Failed to open a new tab" in msg or "Target closed" in msg:
-                        print("[browser] Browser context became stale; restarting Chrome before continuing...")
-                        chrome_proc = reset_chrome(find_chrome(args.chrome_path))
-                        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
-                        context = browser.contexts[0] if browser.contexts else browser.new_context()
-                        page = context.new_page()
-                    else:
-                        raise
-                page.set_default_timeout(30000)
                 print(f"[{n}/{len(parts)}] {pn} ... ", end="", flush=True)
-                try:
-                    result = process_part(page, pn, args)
-                except KeyboardInterrupt:
-                    raise
-                except Exception as e:
-                    log_action("Error", f"{type(e).__name__}: {e}")
-                    result = [{"Partslink Number": pn, "Status": f"error: {type(e).__name__}"}]
-                    if args.debug:
-                        dump_debug(page, pn, "error")
-                else:
-                    statuses = ", ".join(sorted({r.get('Status', '') for r in result}))
-                    log_action("Result", statuses)
-                    print(statuses)
+                for attempt in range(2):
+                    try:
+                        if page.is_closed():
+                            raise RuntimeError("Target page, context or browser has been closed")
+                        result = process_part(page, pn, args)
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as e:
+                        message = str(e).casefold()
+                        browser_closed = page.is_closed() or "target page, context or browser has been closed" in message
+                        if browser_closed and attempt == 0:
+                            print("\n[browser] Browser context closed; reconnecting and retrying this part...")
+                            reconnect_browser()
+                            continue
+                        log_action("Error", f"{type(e).__name__}: {e}")
+                        result = [{"Partslink Number": pn, "Status": f"error: {type(e).__name__}"}]
+                        if args.debug:
+                            dump_debug(page, pn, "error")
+                        break
+                    else:
+                        statuses = ", ".join(sorted({r.get('Status', '') for r in result}))
+                        log_action("Result", statuses)
+                        print(statuses)
+                        break
                 rows.extend(result)
                 save_results(rows, out_path)
                 if n < len(parts):
@@ -1409,8 +1444,7 @@ def main():
         print("\nStopped by user. Progress is saved; run the same command again to resume.")
     finally:
         save_results(rows, out_path)
-        if chrome_proc:
-            chrome_proc.terminate()
+        stop_chrome(chrome_proc)
     print(f"\nDone. Results: {out_path.resolve()}")
 
 

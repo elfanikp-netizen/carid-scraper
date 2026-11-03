@@ -28,6 +28,7 @@ from carid_scraper import (
     collect_product_links,
     dump_debug,
     find_chrome,
+    get_cdp_port,
     goto,
     human_pause,
     is_product_html,
@@ -37,6 +38,7 @@ from carid_scraper import (
     run_search,
     save_results,
     start_chrome,
+    stop_chrome,
     sync_playwright,
 )
 
@@ -75,6 +77,15 @@ def read_interchange_values(path, column):
             seen.add(v)
             out.append(v)
     return out
+
+
+def completed_interchange_values(rows):
+    return {
+        str(row.get("Interchange Number", "")).strip().casefold()
+        for row in rows
+        if str(row.get("Interchange Number", "")).strip()
+        and not str(row.get("Status", "")).strip().casefold().startswith("error")
+    }
 
 
 def extract_partslink_number_from_html(html):
@@ -248,13 +259,12 @@ def main():
     rows = []
     if out_path.exists() and not args.no_resume:
         rows = load_resume_rows(out_path)
-        done = {
-            str(r.get("Partslink Number", "")).strip()
-            for r in rows
-            if str(r.get("Partslink Number", "")).strip() and not str(r.get("Status", "")).startswith("error")
-        }
-        rows = [r for r in rows if str(r.get("Partslink Number", "")).strip() in done]
-        values = [v for v in values if v not in done]
+        done = completed_interchange_values(rows)
+        rows = [
+            row for row in rows
+            if str(row.get("Interchange Number", "")).strip().casefold() in done
+        ]
+        values = [value for value in values if value.casefold() not in done]
         if done:
             print(f"[resume] {len(done)} already done, {len(values)} left")
         else:
@@ -270,7 +280,7 @@ def main():
             context = None
             while True:
                 try:
-                    browser = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                    browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{get_cdp_port()}")
                     context = browser.contexts[0] if browser.contexts else browser.new_context()
                     page = context.pages[0] if context.pages else context.new_page()
                     page.set_default_timeout(30000)
@@ -285,8 +295,7 @@ def main():
                         except Exception:
                             pass
                         try:
-                            if chrome_proc is not None:
-                                chrome_proc.terminate()
+                            stop_chrome(chrome_proc)
                         except Exception:
                             pass
                         chrome_proc = start_chrome(find_chrome(args.chrome_path))
@@ -311,13 +320,9 @@ def main():
                                     browser.close()
                             except Exception:
                                 pass
-                            try:
-                                if chrome_proc is not None:
-                                    chrome_proc.terminate()
-                            except Exception:
-                                pass
+                            stop_chrome(chrome_proc)
                             chrome_proc = start_chrome(find_chrome(args.chrome_path))
-                            browser = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{get_cdp_port()}")
                             context = browser.contexts[0] if browser.contexts else browser.new_context()
                             page = context.new_page()
                         else:
@@ -342,6 +347,8 @@ def main():
                     log_action("Result", statuses)
                     print(statuses)
 
+                for row in result:
+                    row["Interchange Number"] = value
                 rows.extend(result)
                 save_results(rows, out_path)
                 if n < len(values):
@@ -350,8 +357,7 @@ def main():
         print("\nStopped by user. Progress is saved; run the same command again to resume.")
     finally:
         save_results(rows, out_path)
-        if chrome_proc:
-            chrome_proc.terminate()
+        stop_chrome(chrome_proc)
     print(f"\nDone. Results: {out_path.resolve()}")
 
 
