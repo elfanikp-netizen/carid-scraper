@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+from collections import Counter
 import os
 import re
 import sys
@@ -29,12 +30,15 @@ from carid_scraper import (
     dump_debug,
     find_chrome,
     get_cdp_port,
+    expand_results_by_inputs,
+    group_query_values,
     goto,
     human_pause,
     is_product_html,
     load_resume_rows,
     log_action,
     parse_product,
+    result_groups_from_rows,
     run_search,
     save_results,
     start_chrome,
@@ -70,11 +74,10 @@ def read_interchange_values(path, column):
         series = df[pick] if pick else df.iloc[:, 0]
         print(f"[input] Using column: {pick or df.columns[0]!r}")
 
-    seen, out = set(), []
+    out = []
     for v in series.dropna():
         v = str(v).strip()
-        if v and v not in seen:
-            seen.add(v)
+        if v:
             out.append(v)
     return out
 
@@ -259,17 +262,15 @@ def main():
     rows = []
     if out_path.exists() and not args.no_resume:
         rows = load_resume_rows(out_path)
-        done = completed_interchange_values(rows)
-        rows = [
-            row for row in rows
-            if str(row.get("Interchange Number", "")).strip().casefold() in done
-        ]
-        values = [value for value in values if value.casefold() not in done]
-        if done:
-            print(f"[resume] {len(done)} already done, {len(values)} left")
-        else:
-            print("[resume] existing output file does not contain a valid part-number column; starting fresh")
-    if not values:
+    input_groups = group_query_values(values)
+    result_groups = result_groups_from_rows(rows, "Interchange Number")
+    todo = [key for key in input_groups if key not in result_groups]
+    if rows and result_groups:
+        print(f"[resume] {len(result_groups)} already done, {len(todo)} distinct query(s) left")
+    elif rows:
+        print("[resume] existing output file does not contain a valid interchange column; starting fresh")
+    if not todo:
+        save_results(expand_results_by_inputs(values, result_groups), out_path)
         print("Nothing to do.")
         return
 
@@ -306,8 +307,9 @@ def main():
             goto(page, "https://www.carid.com")
             print("[ready] Browser is on carid.com. Starting...\n")
 
-            for n, value in enumerate(values, 1):
-                log_action("Loop", f"Starting interchange {n}/{len(values)}: {value}")
+            for n, key in enumerate(todo, 1):
+                value = values[input_groups[key][0]]
+                log_action("Loop", f"Starting interchange {n}/{len(todo)}: {value}")
                 if page is None:
                     try:
                         page = context.new_page()
@@ -349,14 +351,15 @@ def main():
 
                 for row in result:
                     row["Interchange Number"] = value
-                rows.extend(result)
+                result_groups[key] = result
+                rows = expand_results_by_inputs(values, result_groups)
                 save_results(rows, out_path)
-                if n < len(values):
+                if n < len(todo):
                     human_pause(args.delay_min, args.delay_max)
     except KeyboardInterrupt:
         print("\nStopped by user. Progress is saved; run the same command again to resume.")
     finally:
-        save_results(rows, out_path)
+        save_results(expand_results_by_inputs(values, result_groups), out_path)
         stop_chrome(chrome_proc)
     print(f"\nDone. Results: {out_path.resolve()}")
 

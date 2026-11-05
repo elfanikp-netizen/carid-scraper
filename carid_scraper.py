@@ -19,6 +19,7 @@ USAGE
 """
 
 import argparse
+from collections import Counter
 import json
 import os
 import platform
@@ -1263,11 +1264,10 @@ def read_part_numbers(path, column):
         pick = next((c for c in df.columns if re.search(r"part\s*-?\s*link|partslink|part\s*(no|num)", str(c), re.I)), None)
         series = df[pick] if pick else df.iloc[:, 0]
         print(f"[input] Using column: {pick or df.columns[0]!r}")
-    seen, out = set(), []
+    out = []
     for v in series.dropna():
         v = str(v).strip()
-        if v and v not in seen:
-            seen.add(v)
+        if v:
             out.append(v)
     return out
 
@@ -1326,6 +1326,34 @@ def load_resume_rows(out_path):
     return [normalize_resume_row(r) for r in prev.to_dict("records")]
 
 
+def group_query_values(values):
+    groups = {}
+    for index, value in enumerate(values):
+        groups.setdefault(_normalize_part_value(value), []).append(index)
+    return groups
+
+
+def result_groups_from_rows(rows, query_column):
+    groups = {}
+    for row in rows:
+        query = _normalize_part_value(row.get(query_column, ""))
+        status = str(row.get("Status", "")).strip().casefold()
+        if not query or status.startswith("error"):
+            continue
+        group = groups.setdefault(query, [])
+        if row not in group:
+            group.append(row)
+    return groups
+
+
+def expand_results_by_inputs(values, groups):
+    return [
+        dict(result)
+        for value in values
+        for result in groups.get(_normalize_part_value(value), [])
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # MAIN
 # --------------------------------------------------------------------------- #
@@ -1361,19 +1389,15 @@ def main():
     rows = []
     if out_path.exists() and not args.no_resume:
         rows = load_resume_rows(out_path)
-        done = {
-            str(r.get("Partslink Number", "")).strip()
-            for r in rows
-            if str(r.get("Partslink Number", "")).strip()
-            and not str(r.get("Status", "")).startswith("error")
-        }
-        rows = [r for r in rows if str(r.get("Partslink Number", "")).strip() in done]
-        parts = [p for p in parts if p not in done]
-        if done:
-            print(f"[resume] {len(done)} already done, {len(parts)} left")
-        else:
-            print("[resume] existing output file does not contain a valid part-number column; starting fresh")
-    if not parts:
+    input_groups = group_query_values(parts)
+    result_groups = result_groups_from_rows(rows, "Partslink Number")
+    todo = [key for key in input_groups if key not in result_groups]
+    if rows and result_groups:
+        print(f"[resume] {len(result_groups)} already done, {len(todo)} distinct query(s) left")
+    elif rows:
+        print("[resume] existing output file does not contain a valid part-number column; starting fresh")
+    if not todo:
+        save_results(expand_results_by_inputs(parts, result_groups), out_path)
         print("Nothing to do.")
         return
 
@@ -1409,9 +1433,10 @@ def main():
                 page = context.pages[0] if context.pages else context.new_page()
                 page.set_default_timeout(30000)
 
-            for n, pn in enumerate(parts, 1):
-                log_action("Loop", f"Starting part {n}/{len(parts)}: {pn}")
-                print(f"[{n}/{len(parts)}] {pn} ... ", end="", flush=True)
+            for n, key in enumerate(todo, 1):
+                pn = parts[input_groups[key][0]]
+                log_action("Loop", f"Starting part {n}/{len(todo)}: {pn}")
+                print(f"[{n}/{len(todo)}] {pn} ... ", end="", flush=True)
                 for attempt in range(2):
                     try:
                         if page.is_closed():
@@ -1436,14 +1461,15 @@ def main():
                         log_action("Result", statuses)
                         print(statuses)
                         break
-                rows.extend(result)
+                result_groups[key] = result
+                rows = expand_results_by_inputs(parts, result_groups)
                 save_results(rows, out_path)
-                if n < len(parts):
+                if n < len(todo):
                     human_pause(args.delay_min, args.delay_max)
     except KeyboardInterrupt:
         print("\nStopped by user. Progress is saved; run the same command again to resume.")
     finally:
-        save_results(rows, out_path)
+        save_results(expand_results_by_inputs(parts, result_groups), out_path)
         stop_chrome(chrome_proc)
     print(f"\nDone. Results: {out_path.resolve()}")
 
